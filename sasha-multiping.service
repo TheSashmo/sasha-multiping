@@ -1,0 +1,15 @@
+[Unit]
+Description=Sasha Multi-Ping Monitor
+After=graphical.target
+
+[Service]
+Type=simple
+Environment="DISPLAY=:0"
+Environment="XAUTHORITY=/home/user/.Xauthority"
+WorkingDirectory=/home/user/sasha_multiping
+ExecStart=/usr/bin/python3 /home/user/sasha_multiping/gui_monitor.py --window 30
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

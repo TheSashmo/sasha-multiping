@@ -51,6 +51,7 @@ class Target:
     ip: str
     name: str
     interface: Optional[str] = None  # Network interface to use for ping
+    consecutive_loss_threshold: int = 1  # Number of consecutive losses before marking as down (1 = plot all)
 
 
 class PingMonitor:
@@ -73,6 +74,14 @@ class PingMonitor:
             target.ip: deque() for target in self.targets
         }
 
+        # Track consecutive losses per target for threshold logic
+        self.consecutive_losses: Dict[str, int] = {
+            target.ip: 0 for target in self.targets
+        }
+        self.last_successful_rtt: Dict[str, Optional[float]] = {
+            target.ip: None for target in self.targets
+        }
+
         self.running = False
         self.threads: List[threading.Thread] = []
         self.lock = threading.Lock()
@@ -85,30 +94,96 @@ class PingMonitor:
                 # Perform ping (returns time in ms or None)
                 result = ping(target.ip, timeout=self.timeout, unit='ms')
 
-                ping_result = PingResult(
-                    timestamp=datetime.now(),
-                    rtt_ms=result if result is not None else None,
-                    success=result is not None
-                )
-
                 with self.lock:
-                    # Ensure history exists for this target
+                    # Ensure history and tracking exist for this target
                     if target.ip not in self.history:
                         self.history[target.ip] = deque()
-                    self.history[target.ip].append(ping_result)
+                    if target.ip not in self.consecutive_losses:
+                        self.consecutive_losses[target.ip] = 0
+                    if target.ip not in self.last_successful_rtt:
+                        self.last_successful_rtt[target.ip] = None
+
+                    if result is not None:
+                        # Ping succeeded
+                        self.consecutive_losses[target.ip] = 0
+                        self.last_successful_rtt[target.ip] = result
+
+                        ping_result = PingResult(
+                            timestamp=datetime.now(),
+                            rtt_ms=result,
+                            success=True
+                        )
+                        self.history[target.ip].append(ping_result)
+                    else:
+                        # Ping failed
+                        self.consecutive_losses[target.ip] += 1
+                        threshold = target.consecutive_loss_threshold
+
+                        if self.consecutive_losses[target.ip] < threshold:
+                            # Below threshold: mask the loss by duplicating last successful value
+                            ping_result = PingResult(
+                                timestamp=datetime.now(),
+                                rtt_ms=self.last_successful_rtt[target.ip],
+                                success=True  # Masked as success
+                            )
+                            self.history[target.ip].append(ping_result)
+                        else:
+                            # At or above threshold: record as actual failure
+                            ping_result = PingResult(
+                                timestamp=datetime.now(),
+                                rtt_ms=None,
+                                success=False
+                            )
+                            self.history[target.ip].append(ping_result)
+
+                            # Retroactively mark previous (threshold-1) masked losses as failures
+                            if self.consecutive_losses[target.ip] == threshold and threshold > 1:
+                                history = self.history[target.ip]
+                                # Go backwards from second-to-last (just before the one we just added)
+                                for i in range(len(history) - 2, max(-1, len(history) - threshold - 1), -1):
+                                    if i >= 0 and history[i].success and history[i].rtt_ms == self.last_successful_rtt[target.ip]:
+                                        # This looks like a masked loss, convert it to real failure
+                                        history[i].rtt_ms = None
+                                        history[i].success = False
+
                     self._cleanup_old_data(target.ip)
 
             except Exception as e:
-                # On error, record as failed ping
+                # On error, treat as failed ping
                 with self.lock:
-                    # Ensure history exists for this target
                     if target.ip not in self.history:
                         self.history[target.ip] = deque()
-                    self.history[target.ip].append(PingResult(
-                        timestamp=datetime.now(),
-                        rtt_ms=None,
-                        success=False
-                    ))
+                    if target.ip not in self.consecutive_losses:
+                        self.consecutive_losses[target.ip] = 0
+                    if target.ip not in self.last_successful_rtt:
+                        self.last_successful_rtt[target.ip] = None
+
+                    self.consecutive_losses[target.ip] += 1
+                    threshold = target.consecutive_loss_threshold
+
+                    if self.consecutive_losses[target.ip] < threshold:
+                        # Below threshold: mask the loss
+                        ping_result = PingResult(
+                            timestamp=datetime.now(),
+                            rtt_ms=self.last_successful_rtt[target.ip],
+                            success=True
+                        )
+                    else:
+                        # At or above threshold: record as failure
+                        ping_result = PingResult(
+                            timestamp=datetime.now(),
+                            rtt_ms=None,
+                            success=False
+                        )
+                        # Retroactively mark previous masked losses
+                        if self.consecutive_losses[target.ip] == threshold and threshold > 1:
+                            history = self.history[target.ip]
+                            for i in range(len(history) - 1, max(-1, len(history) - threshold), -1):
+                                if i >= 0 and history[i].success and history[i].rtt_ms == self.last_successful_rtt[target.ip]:
+                                    history[i].rtt_ms = None
+                                    history[i].success = False
+
+                    self.history[target.ip].append(ping_result)
 
             time.sleep(self.ping_interval)
 
@@ -608,7 +683,8 @@ class WebController:
                 'ping_interval': self.monitor.ping_interval,
                 'chart_window_minutes': self.monitor.chart_window_minutes,
                 'line_thickness': self.monitor.line_thickness,
-                'targets': [{'name': t.name, 'ip': t.ip, 'interface': t.interface} for t in self.monitor.targets]
+                'num_columns': self.monitor.num_columns,
+                'targets': [{'name': t.name, 'ip': t.ip, 'interface': t.interface, 'consecutive_loss_threshold': t.consecutive_loss_threshold} for t in self.monitor.targets]
             })
 
         @self.app.route('/api/line-thickness', methods=['POST'])
@@ -655,6 +731,28 @@ class WebController:
                     json.dump(config, f, indent=2)
 
                 return jsonify({'status': 'success', 'message': 'Font scale saved. Restart required.'})
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/num-columns', methods=['POST'])
+        def update_num_columns():
+            """Update number of chart columns (requires restart to take effect)"""
+            try:
+                num_cols = request.json.get('num_columns')
+                if num_cols is None or num_cols < 1 or num_cols > 10:
+                    return jsonify({'error': 'Invalid number of columns. Must be between 1 and 10'}), 400
+
+                # Load current config
+                with open(self.config_path, 'r') as f:
+                    config = json.load(f)
+
+                config['num_columns'] = num_cols
+
+                # Save
+                with open(self.config_path, 'w') as f:
+                    json.dump(config, f, indent=2)
+
+                return jsonify({'status': 'success', 'message': 'Chart columns saved. Restart required.'})
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
 
@@ -980,15 +1078,16 @@ WEB_UI_TEMPLATE = '''
                         <th>Name</th>
                         <th>IP Address</th>
                         <th>Interface</th>
+                        <th>Loss Threshold</th>
                         <th style="width: 80px; text-align: center;">Action</th>
                     </tr>
                 </thead>
                 <tbody id="targets-table">
-                    <tr><td colspan="4" style="text-align: center; color: #888;">Loading...</td></tr>
+                    <tr><td colspan="5" style="text-align: center; color: #888;">Loading...</td></tr>
                 </tbody>
             </table>
 
-            <div class="add-target-form" style="grid-template-columns: 2fr 2fr 2fr auto;">
+            <div class="add-target-form" style="grid-template-columns: 2fr 2fr 1.5fr 1fr auto;">
                 <div class="form-group" style="margin: 0;">
                     <label>Target Name</label>
                     <input type="text" id="new-target-name" placeholder="e.g., Google DNS">
@@ -1002,6 +1101,10 @@ WEB_UI_TEMPLATE = '''
                     <select id="new-target-interface">
                         <option value="">Default</option>
                     </select>
+                </div>
+                <div class="form-group" style="margin: 0;">
+                    <label>Loss Threshold</label>
+                    <input type="number" id="new-target-threshold" min="1" max="10" value="1" placeholder="1" title="Number of consecutive ping losses before marking as down (1 = plot all losses)">
                 </div>
                 <div>
                     <label style="opacity: 0;">Add</label>
@@ -1044,6 +1147,12 @@ WEB_UI_TEMPLATE = '''
                     <input type="range" id="font-scale" min="0.5" max="4.0" value="2.0" step="0.1" style="width: 100%;">
                     <button onclick="updateFontScale()" style="margin-top: 10px;">💾 Update Font Scale</button>
                 </div>
+
+                <div class="form-group">
+                    <label>Chart Columns (1-10): <span id="num-columns-value">2</span></label>
+                    <input type="range" id="num-columns" min="1" max="10" value="2" step="1" style="width: 100%;">
+                    <button onclick="updateNumColumns()" style="margin-top: 10px;">💾 Update Columns</button>
+                </div>
             </div>
 
             <div style="margin-top: 20px;">
@@ -1055,6 +1164,7 @@ WEB_UI_TEMPLATE = '''
     <script>
         let currentTargets = [];
         let availableInterfaces = [];
+        let editingIndex = null; // Track which target is being edited
 
         function showMessage(elementId, message, type) {
             const el = document.getElementById(elementId);
@@ -1081,6 +1191,12 @@ WEB_UI_TEMPLATE = '''
                 if (data.line_thickness !== undefined) {
                     document.getElementById('line-thickness').value = data.line_thickness;
                     document.getElementById('line-thickness-value').textContent = data.line_thickness;
+                }
+
+                // Update num_columns slider
+                if (data.num_columns !== undefined) {
+                    document.getElementById('num-columns').value = data.num_columns;
+                    document.getElementById('num-columns-value').textContent = data.num_columns;
                 }
 
                 // Load font scale from config
@@ -1118,7 +1234,7 @@ WEB_UI_TEMPLATE = '''
         function renderTargetsTable() {
             const tbody = document.getElementById('targets-table');
             if (currentTargets.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #888;">No targets configured</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #888;">No targets configured</td></tr>';
                 return;
             }
 
@@ -1127,7 +1243,9 @@ WEB_UI_TEMPLATE = '''
                     <td>${target.name}</td>
                     <td style="font-family: monospace;">${target.ip}</td>
                     <td>${target.interface || 'Default'}</td>
+                    <td>${target.consecutive_loss_threshold || 1}</td>
                     <td style="text-align: center;">
+                        <button onclick="editTarget(${index})" class="btn-primary btn-small" style="margin-right: 5px;">✏️</button>
                         <button onclick="deleteTarget(${index})" class="btn-danger btn-small">🗑️</button>
                     </td>
                 </tr>
@@ -1138,6 +1256,7 @@ WEB_UI_TEMPLATE = '''
             const name = document.getElementById('new-target-name').value.trim();
             const ip = document.getElementById('new-target-ip').value.trim();
             const iface = document.getElementById('new-target-interface').value;
+            const threshold = parseInt(document.getElementById('new-target-threshold').value) || 1;
 
             if (!name || !ip) {
                 showMessage('targets-message', 'Please enter both name and IP address', 'error');
@@ -1146,12 +1265,20 @@ WEB_UI_TEMPLATE = '''
 
             // Allow both IP addresses and domain names (validation removed)
 
-            // Add to current targets
-            const newTarget = {name, ip};
+            const targetData = {name, ip, consecutive_loss_threshold: threshold};
             if (iface) {
-                newTarget.interface = iface;
+                targetData.interface = iface;
             }
-            currentTargets.push(newTarget);
+
+            if (editingIndex !== null) {
+                // Update existing target
+                currentTargets[editingIndex] = targetData;
+                var action = 'updated';
+            } else {
+                // Add new target
+                currentTargets.push(targetData);
+                var action = 'added';
+            }
 
             // Update via API
             try {
@@ -1162,20 +1289,63 @@ WEB_UI_TEMPLATE = '''
                 });
 
                 if (response.ok) {
-                    showMessage('targets-message', `Target "${name}" added successfully!`, 'success');
-                    document.getElementById('new-target-name').value = '';
-                    document.getElementById('new-target-ip').value = '';
-                    document.getElementById('new-target-interface').value = '';
+                    showMessage('targets-message', `Target "${name}" ${action} successfully!`, 'success');
+                    cancelEdit();
                     loadStatus();
                 } else {
                     const error = await response.json();
                     showMessage('targets-message', 'Error: ' + error.error, 'error');
-                    currentTargets.pop(); // Remove if failed
+                    if (editingIndex === null) {
+                        currentTargets.pop(); // Remove if failed to add
+                    }
                 }
             } catch (error) {
                 showMessage('targets-message', 'Error: ' + error.message, 'error');
-                currentTargets.pop(); // Remove if failed
+                if (editingIndex === null) {
+                    currentTargets.pop(); // Remove if failed to add
+                }
             }
+        }
+
+        function editTarget(index) {
+            const target = currentTargets[index];
+            editingIndex = index;
+
+            // Populate form with target data
+            document.getElementById('new-target-name').value = target.name;
+            document.getElementById('new-target-ip').value = target.ip;
+            document.getElementById('new-target-interface').value = target.interface || '';
+            document.getElementById('new-target-threshold').value = target.consecutive_loss_threshold || 1;
+
+            // Update button text and show cancel button
+            const form = document.querySelector('.add-target-form');
+            const buttonContainer = form.querySelector('div:last-child');
+            buttonContainer.innerHTML = `
+                <label style="opacity: 0;">Save</label>
+                <button onclick="addTarget()" style="background: #2196F3;">💾 Save</button>
+                <button onclick="cancelEdit()" style="background: #666; margin-left: 5px;">✖️ Cancel</button>
+            `;
+
+            // Scroll to form
+            form.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+        }
+
+        function cancelEdit() {
+            editingIndex = null;
+
+            // Clear form
+            document.getElementById('new-target-name').value = '';
+            document.getElementById('new-target-ip').value = '';
+            document.getElementById('new-target-interface').value = '';
+            document.getElementById('new-target-threshold').value = '1';
+
+            // Reset button
+            const form = document.querySelector('.add-target-form');
+            const buttonContainer = form.querySelector('div:last-child');
+            buttonContainer.innerHTML = `
+                <label style="opacity: 0;">Add</label>
+                <button onclick="addTarget()">➕ Add Target</button>
+            `;
         }
 
         async function deleteTarget(index) {
@@ -1308,6 +1478,28 @@ WEB_UI_TEMPLATE = '''
             }
         }
 
+        async function updateNumColumns() {
+            try {
+                const num_columns = parseInt(document.getElementById('num-columns').value);
+
+                const response = await fetch('/api/num-columns', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({num_columns})
+                });
+
+                if (response.ok) {
+                    showMessage('settings-message', 'Chart columns saved to ' + num_columns + '! Please manually restart the application to apply.', 'success');
+                    loadStatus();
+                } else {
+                    const error = await response.json();
+                    showMessage('settings-message', 'Error: ' + error.error, 'error');
+                }
+            } catch (error) {
+                showMessage('settings-message', 'Error: ' + error.message, 'error');
+            }
+        }
+
         async function forceReload() {
             try {
                 if (!confirm('Force reload will restart all ping logging. Continue?')) {
@@ -1336,6 +1528,7 @@ WEB_UI_TEMPLATE = '''
         document.addEventListener('DOMContentLoaded', () => {
             const lineThicknessSlider = document.getElementById('line-thickness');
             const fontScaleSlider = document.getElementById('font-scale');
+            const numColumnsSlider = document.getElementById('num-columns');
 
             lineThicknessSlider.addEventListener('input', (e) => {
                 document.getElementById('line-thickness-value').textContent = e.target.value;
@@ -1343,6 +1536,10 @@ WEB_UI_TEMPLATE = '''
 
             fontScaleSlider.addEventListener('input', (e) => {
                 document.getElementById('font-scale-value').textContent = parseFloat(e.target.value).toFixed(1);
+            });
+
+            numColumnsSlider.addEventListener('input', (e) => {
+                document.getElementById('num-columns-value').textContent = e.target.value;
             });
 
             // Allow Enter key to add target
