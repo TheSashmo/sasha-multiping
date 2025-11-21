@@ -2,7 +2,11 @@
 """
 Multi-target ping monitoring GUI desktop application
 Full-screen dashboard with thin line charts - PingPlotter style
+
+Version: 1.03 (Continuous Ping Implementation)
 """
+
+__version__ = "1.03"
 
 import json
 import time
@@ -17,6 +21,8 @@ import sys
 import argparse
 import socket
 import netifaces
+import subprocess
+import re
 from flask import Flask, render_template_string, jsonify, request
 
 try:
@@ -88,12 +94,48 @@ class PingMonitor:
         self.targets_changed = False  # Flag to notify GUI of target changes
 
     def _ping_worker(self, target: Target):
-        """Worker thread that continuously pings a target"""
-        while self.running:
-            try:
-                # Perform ping (returns time in ms or None)
-                result = ping(target.ip, timeout=self.timeout, unit='ms')
+        """Worker thread that runs continuous ping subprocess for a target"""
+        # Start continuous ping process
+        # Using -i for interval, -W for timeout
+        cmd = ['ping', '-i', str(self.ping_interval), '-W', str(int(self.timeout)), target.ip]
 
+        process = None
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1  # Line buffered
+            )
+
+            # Regex to parse ping output: "64 bytes from 8.8.8.8: ... time=12.3 ms"
+            time_pattern = re.compile(r'time[=<](\d+\.?\d*)\s*ms')
+            timeout_pattern = re.compile(r'no answer yet|timed out|100% packet loss|unreachable', re.IGNORECASE)
+
+            print(f"[v1.03] Started continuous ping for {target.name} ({target.ip})")
+
+            # Read output line by line
+            for line in iter(process.stdout.readline, ''):
+                if not self.running:
+                    break
+
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Try to extract RTT from successful ping
+                time_match = time_pattern.search(line)
+                is_timeout = timeout_pattern.search(line)
+
+                result = None
+                if time_match:
+                    try:
+                        result = float(time_match.group(1))
+                    except ValueError:
+                        result = None
+
+                # Process the result (same logic as before)
                 with self.lock:
                     # Ensure history and tracking exist for this target
                     if target.ip not in self.history:
@@ -114,8 +156,8 @@ class PingMonitor:
                             success=True
                         )
                         self.history[target.ip].append(ping_result)
-                    else:
-                        # Ping failed
+                    elif is_timeout or (time_match is None and 'from' not in line and 'PING' not in line):
+                        # Ping failed or timeout detected
                         self.consecutive_losses[target.ip] += 1
                         threshold = target.consecutive_loss_threshold
 
@@ -148,44 +190,22 @@ class PingMonitor:
 
                     self._cleanup_old_data(target.ip)
 
-            except Exception as e:
-                # On error, treat as failed ping
-                with self.lock:
-                    if target.ip not in self.history:
-                        self.history[target.ip] = deque()
-                    if target.ip not in self.consecutive_losses:
-                        self.consecutive_losses[target.ip] = 0
-                    if target.ip not in self.last_successful_rtt:
-                        self.last_successful_rtt[target.ip] = None
-
-                    self.consecutive_losses[target.ip] += 1
-                    threshold = target.consecutive_loss_threshold
-
-                    if self.consecutive_losses[target.ip] < threshold:
-                        # Below threshold: mask the loss
-                        ping_result = PingResult(
-                            timestamp=datetime.now(),
-                            rtt_ms=self.last_successful_rtt[target.ip],
-                            success=True
-                        )
-                    else:
-                        # At or above threshold: record as failure
-                        ping_result = PingResult(
-                            timestamp=datetime.now(),
-                            rtt_ms=None,
-                            success=False
-                        )
-                        # Retroactively mark previous masked losses
-                        if self.consecutive_losses[target.ip] == threshold and threshold > 1:
-                            history = self.history[target.ip]
-                            for i in range(len(history) - 1, max(-1, len(history) - threshold), -1):
-                                if i >= 0 and history[i].success and history[i].rtt_ms == self.last_successful_rtt[target.ip]:
-                                    history[i].rtt_ms = None
-                                    history[i].success = False
-
-                    self.history[target.ip].append(ping_result)
-
-            time.sleep(self.ping_interval)
+        except Exception as e:
+            print(f"[v1.03] Ping worker error for {target.ip}: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Cleanup: terminate the ping process
+            if process:
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+            print(f"[v1.03] Stopped continuous ping for {target.name} ({target.ip})")
 
     def _cleanup_old_data(self, ip: str):
         """Remove data older than history_retention_hours"""
@@ -284,9 +304,12 @@ class PingMonitorGUI:
         self.main_frame = tk.Frame(self.root, bg='#2d2d2d')
         self.main_frame.pack(fill=tk.BOTH, expand=True)
 
+        # Add IP/URL info label in bottom right corner
+        self.create_access_info_label()
+
         # Track current targets to detect changes
         self.current_target_ips = set()
-        
+
         # Get line thickness and columns from monitor
         self.line_thickness = monitor.line_thickness
         self.num_columns = monitor.num_columns
@@ -296,6 +319,97 @@ class PingMonitorGUI:
 
         # Start update loop
         self.update_display()
+
+    def get_network_ips(self):
+        """Get all network IP addresses (excluding localhost)"""
+        ips = []
+        try:
+            import netifaces
+            for iface in netifaces.interfaces():
+                try:
+                    addrs = netifaces.ifaddresses(iface)
+                    if netifaces.AF_INET in addrs:
+                        for addr in addrs[netifaces.AF_INET]:
+                            ip = addr.get('addr', '')
+                            # Skip localhost and empty IPs
+                            if ip and not ip.startswith('127.'):
+                                ips.append(ip)
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"Error getting network interfaces: {e}")
+
+        return ips if ips else ['localhost']
+
+    def create_access_info_label(self):
+        """Create a label in the bottom right corner showing IP/URL access info"""
+        # Get initial IPs
+        self.current_ips = self.get_network_ips()
+
+        # Create label text
+        urls = [f'http://{ip}:5000' for ip in self.current_ips]
+        url_text = ' | '.join(urls)
+        info_text = f'Web Control Panel: {url_text}'
+
+        # Create label with smaller font
+        font_size = int(9 * self.font_scale)
+        self.access_info_label = tk.Label(
+            self.root,
+            text=info_text,
+            bg='#2d2d2d',
+            fg='#888888',
+            font=('Courier', font_size),
+            anchor='e',
+            justify='right'
+        )
+
+        # Place in bottom right corner
+        self.access_info_label.place(relx=1.0, rely=1.0, anchor='se', x=-10, y=-5)
+
+        # Track last update time for IP refresh
+        self.last_ip_update = 0
+
+    def update_access_info_label(self):
+        """Update the IP/URL label if network IPs have changed"""
+        import time
+        current_time = time.time()
+
+        # Only check for IP changes every 10 seconds
+        if current_time - self.last_ip_update < 10:
+            return
+
+        self.last_ip_update = current_time
+
+        # Get current IPs
+        new_ips = self.get_network_ips()
+
+        # Update label if IPs have changed
+        if new_ips != self.current_ips:
+            self.current_ips = new_ips
+            urls = [f'http://{ip}:5000' for ip in self.current_ips]
+            url_text = ' | '.join(urls)
+            info_text = f'Web Control Panel: {url_text}'
+            self.access_info_label.config(text=info_text)
+            print(f"Network IP updated to: {', '.join(self.current_ips)}")
+
+    def truncate_title(self, name, ip, max_length=25):
+        """Truncate title to prevent overlap with stats"""
+        full_title = f"{name} ({ip})"
+        if len(full_title) <= max_length:
+            return full_title
+
+        # Calculate space for IP (including parentheses and space)
+        ip_space = len(ip) + 3  # " ()" = 3 chars
+
+        # Calculate available space for name
+        available_for_name = max_length - ip_space - 3  # -3 for "..."
+
+        if available_for_name > 0:
+            truncated_name = name[:available_for_name] + "..."
+            return f"{truncated_name} ({ip})"
+        else:
+            # If even truncated name doesn't fit, just truncate the whole thing
+            return full_title[:max_length-3] + "..."
 
     def create_equal_chart_grid(self):
         """Create grid with configurable columns"""
@@ -500,8 +614,9 @@ class PingMonitorGUI:
             pl = f"{stats['packet_loss']:.1f}"
 
             stats_text = f"Cur:{cur} Avg:{avg} Min:{min_val} Max:{max_val} PL:{pl}%"
-            ax.text(1.0, 1.02, stats_text, transform=ax.transAxes,
-                   fontsize=int(7*self.font_scale), color='#ffffff', ha='right', va='bottom')
+            # Position stats on second line below title
+            ax.text(1.0, 0.98, stats_text, transform=ax.transAxes,
+                   fontsize=int(7*self.font_scale), color='#ffffff', ha='right', va='top')
 
 
             # Redraw
@@ -523,6 +638,9 @@ class PingMonitorGUI:
                 print(f"[GUI] Charts rebuilt with {len(self.monitor.targets)} targets")
 
             self.update_charts()
+
+            # Update IP address label (checks every 10 seconds for changes)
+            self.update_access_info_label()
         except Exception as e:
             print(f"Update error: {e}")
             import traceback
@@ -674,6 +792,30 @@ class WebController:
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/access-info', methods=['GET'])
+        def get_access_info():
+            """Get URLs to access the control panel"""
+            try:
+                urls = []
+                port = 5000
+
+                # Get all non-loopback IPv4 addresses
+                for iface in netifaces.interfaces():
+                    addrs = netifaces.ifaddresses(iface)
+                    if netifaces.AF_INET in addrs:
+                        for addr in addrs[netifaces.AF_INET]:
+                            ip = addr.get('addr')
+                            if ip and ip != '127.0.0.1':
+                                urls.append(f'http://{ip}:{port}')
+
+                # Add localhost as fallback
+                if not urls:
+                    urls.append(f'http://localhost:{port}')
+
+                return jsonify({'urls': urls})
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/api/status', methods=['GET'])
         def get_status():
             """Get current monitor status"""
@@ -753,6 +895,41 @@ class WebController:
                     json.dump(config, f, indent=2)
 
                 return jsonify({'status': 'success', 'message': 'Chart columns saved. Restart required.'})
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/restart-target', methods=['POST'])
+        def restart_target():
+            """Restart a single target without affecting others"""
+            try:
+                target_ip = request.json.get('ip')
+                if not target_ip:
+                    return jsonify({'error': 'Missing target IP'}), 400
+
+                # Find the target
+                target = None
+                for t in self.monitor.targets:
+                    if t.ip == target_ip:
+                        target = t
+                        break
+
+                if not target:
+                    return jsonify({'error': 'Target not found'}), 404
+
+                with self.monitor.lock:
+                    # Reset consecutive loss counter
+                    if target_ip in self.monitor.consecutive_losses:
+                        self.monitor.consecutive_losses[target_ip] = 0
+
+                    # Clear last successful RTT
+                    if target_ip in self.monitor.last_successful_rtt:
+                        self.monitor.last_successful_rtt[target_ip] = None
+
+                    # Clear history for this target
+                    if target_ip in self.monitor.history:
+                        self.monitor.history[target_ip].clear()
+
+                return jsonify({'status': 'success', 'message': f'Target {target.name} restarted'})
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
 
@@ -1079,7 +1256,7 @@ WEB_UI_TEMPLATE = '''
                         <th>IP Address</th>
                         <th>Interface</th>
                         <th>Loss Threshold</th>
-                        <th style="width: 80px; text-align: center;">Action</th>
+                        <th style="width: 120px; text-align: center;">Actions</th>
                     </tr>
                 </thead>
                 <tbody id="targets-table">
@@ -1117,46 +1294,46 @@ WEB_UI_TEMPLATE = '''
             <h2>Settings</h2>
             <div id="settings-message" class="message"></div>
 
-            <div class="settings-grid">
-                <div class="form-group">
-                    <label>Ping Interval (seconds)</label>
-                    <input type="number" id="ping-interval" min="1" max="60" value="5">
-                    <button onclick="updatePingInterval()" style="margin-top: 10px;">💾 Update Interval</button>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <label style="min-width: 140px;">Ping Interval (sec)</label>
+                    <input type="number" id="ping-interval" min="1" max="60" value="5" style="width: 60px; padding: 6px;">
+                    <button onclick="updatePingInterval()" style="padding: 6px 10px;">💾</button>
                 </div>
 
-                <div class="form-group">
-                    <label>Chart Window Duration</label>
-                    <select id="window-duration">
-                        <option value="1">1 minute</option>
-                        <option value="5">5 minutes</option>
-                        <option value="10">10 minutes</option>
-                        <option value="30" selected>30 minutes</option>
-                        <option value="60">60 minutes</option>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <label style="min-width: 140px;">Time Window</label>
+                    <select id="window-duration" style="padding: 6px; width: 110px;">
+                        <option value="1">1 min</option>
+                        <option value="5">5 min</option>
+                        <option value="10">10 min</option>
+                        <option value="30" selected>30 min</option>
+                        <option value="60">60 min</option>
+                        <option value="180">3 hours</option>
+                        <option value="360">6 hours</option>
+                        <option value="720">12 hours</option>
+                        <option value="1440">24 hours</option>
                     </select>
-                    <button onclick="updateWindowDuration()" style="margin-top: 10px;" class="btn-secondary">💾 Update Window</button>
+                    <button onclick="updateWindowDuration()" style="padding: 6px 10px;">💾</button>
                 </div>
 
-                <div class="form-group">
-                    <label>Line Thickness (1-5): <span id="line-thickness-value">2</span></label>
-                    <input type="range" id="line-thickness" min="1" max="5" value="2" step="1" style="width: 100%;">
-                    <button onclick="updateLineThickness()" style="margin-top: 10px;">💾 Update Thickness</button>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <label style="min-width: 140px;">Line Thickness</label>
+                    <input type="number" id="line-thickness" min="1" max="5" value="2" step="1" style="width: 60px; padding: 6px;">
+                    <button onclick="updateLineThickness()" style="padding: 6px 10px;">💾</button>
                 </div>
 
-                <div class="form-group">
-                    <label>Font Scale (0.5-4.0): <span id="font-scale-value">2.0</span></label>
-                    <input type="range" id="font-scale" min="0.5" max="4.0" value="2.0" step="0.1" style="width: 100%;">
-                    <button onclick="updateFontScale()" style="margin-top: 10px;">💾 Update Font Scale</button>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <label style="min-width: 140px;">Font Scale</label>
+                    <input type="number" id="font-scale" min="0.5" max="4.0" value="2.0" step="0.1" style="width: 60px; padding: 6px;">
+                    <button onclick="updateFontScale()" style="padding: 6px 10px;">💾 & Restart</button>
                 </div>
 
-                <div class="form-group">
-                    <label>Chart Columns (1-10): <span id="num-columns-value">2</span></label>
-                    <input type="range" id="num-columns" min="1" max="10" value="2" step="1" style="width: 100%;">
-                    <button onclick="updateNumColumns()" style="margin-top: 10px;">💾 Update Columns</button>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <label style="min-width: 140px;">Chart Columns</label>
+                    <input type="number" id="num-columns" min="1" max="10" value="2" step="1" style="width: 60px; padding: 6px;">
+                    <button onclick="updateNumColumns()" style="padding: 6px 10px;">💾 & Restart</button>
                 </div>
-            </div>
-
-            <div style="margin-top: 20px;">
-                <button onclick="forceReload()" class="btn-danger">🔄 Force Reload Configuration</button>
             </div>
         </div>
     </div>
@@ -1183,20 +1360,29 @@ WEB_UI_TEMPLATE = '''
                 document.getElementById('status-running').textContent = data.running ? '✅ Running' : '❌ Stopped';
                 document.getElementById('status-targets').textContent = data.num_targets;
                 document.getElementById('status-interval').textContent = data.ping_interval + 's';
-                document.getElementById('status-window').textContent = data.chart_window_minutes + ' min';
+
+                // Format window duration
+                const minutes = data.chart_window_minutes;
+                let windowText;
+                if (minutes >= 60) {
+                    const hours = minutes / 60;
+                    windowText = hours + (hours === 1 ? ' hour' : ' hours');
+                } else {
+                    windowText = minutes + ' min';
+                }
+                document.getElementById('status-window').textContent = windowText;
+
                 document.getElementById('ping-interval').value = data.ping_interval;
                 document.getElementById('window-duration').value = data.chart_window_minutes;
 
-                // Update line thickness slider
+                // Update line thickness
                 if (data.line_thickness !== undefined) {
                     document.getElementById('line-thickness').value = data.line_thickness;
-                    document.getElementById('line-thickness-value').textContent = data.line_thickness;
                 }
 
-                // Update num_columns slider
+                // Update num_columns
                 if (data.num_columns !== undefined) {
                     document.getElementById('num-columns').value = data.num_columns;
-                    document.getElementById('num-columns-value').textContent = data.num_columns;
                 }
 
                 // Load font scale from config
@@ -1204,7 +1390,6 @@ WEB_UI_TEMPLATE = '''
                 const config = await configResponse.json();
                 if (config.font_scale !== undefined) {
                     document.getElementById('font-scale').value = config.font_scale;
-                    document.getElementById('font-scale-value').textContent = config.font_scale.toFixed(1);
                 }
 
                 currentTargets = data.targets || [];
@@ -1234,22 +1419,53 @@ WEB_UI_TEMPLATE = '''
         function renderTargetsTable() {
             const tbody = document.getElementById('targets-table');
             if (currentTargets.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #888;">No targets configured</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #888;">No targets configured</td></tr>';
                 return;
             }
 
-            tbody.innerHTML = currentTargets.map((target, index) => `
-                <tr>
-                    <td>${target.name}</td>
-                    <td style="font-family: monospace;">${target.ip}</td>
-                    <td>${target.interface || 'Default'}</td>
-                    <td>${target.consecutive_loss_threshold || 1}</td>
-                    <td style="text-align: center;">
-                        <button onclick="editTarget(${index})" class="btn-primary btn-small" style="margin-right: 5px;">✏️</button>
-                        <button onclick="deleteTarget(${index})" class="btn-danger btn-small">🗑️</button>
-                    </td>
-                </tr>
-            `).join('');
+            tbody.innerHTML = currentTargets.map((target, index) => {
+                if (editingIndex === index) {
+                    // Inline edit mode
+                    return `
+                        <tr style="background: #2a2a2a;">
+                            <td><input type="text" id="edit-name-${index}" value="${target.name}" style="width: 100%; padding: 4px;"></td>
+                            <td><input type="text" id="edit-ip-${index}" value="${target.ip}" style="width: 100%; padding: 4px; font-family: monospace;"></td>
+                            <td>
+                                <select id="edit-interface-${index}" style="width: 100%; padding: 4px;">
+                                    <option value="">Default</option>
+                                    ${availableInterfaces.map(iface =>
+                                        `<option value="${iface.name}" ${target.interface === iface.name ? 'selected' : ''}>${iface.name} (${iface.ip})</option>`
+                                    ).join('')}
+                                </select>
+                            </td>
+                            <td><input type="number" id="edit-threshold-${index}" value="${target.consecutive_loss_threshold || 1}" min="1" max="10" style="width: 60px; padding: 4px;"></td>
+                            <td style="text-align: center; white-space: nowrap;">
+                                <button onclick="saveEdit(${index})" class="btn-primary btn-small" style="margin-right: 3px;">💾</button>
+                                <button onclick="cancelEdit()" class="btn-secondary btn-small">✖️</button>
+                            </td>
+                        </tr>
+                    `;
+                } else {
+                    // Normal view mode
+                    return `
+                        <tr id="target-row-${index}">
+                            <td>${target.name}</td>
+                            <td style="font-family: monospace;">${target.ip}</td>
+                            <td>${target.interface || 'Default'}</td>
+                            <td>
+                                <input type="number" min="1" max="10" value="${target.consecutive_loss_threshold || 1}"
+                                       onchange="updateThreshold(${index}, this.value)"
+                                       style="width: 60px; padding: 4px; text-align: center;">
+                            </td>
+                            <td style="text-align: center; white-space: nowrap;">
+                                <button onclick="editTarget(${index})" class="btn-primary btn-small" style="margin-right: 3px;" title="Edit">✏️</button>
+                                <button onclick="restartTarget(${index})" class="btn-secondary btn-small" style="margin-right: 3px;" title="Restart">🔄</button>
+                                <button onclick="deleteTarget(${index})" class="btn-danger btn-small" title="Delete">🗑️</button>
+                            </td>
+                        </tr>
+                    `;
+                }
+            }).join('');
         }
 
         async function addTarget() {
@@ -1263,22 +1479,13 @@ WEB_UI_TEMPLATE = '''
                 return;
             }
 
-            // Allow both IP addresses and domain names (validation removed)
-
             const targetData = {name, ip, consecutive_loss_threshold: threshold};
             if (iface) {
                 targetData.interface = iface;
             }
 
-            if (editingIndex !== null) {
-                // Update existing target
-                currentTargets[editingIndex] = targetData;
-                var action = 'updated';
-            } else {
-                // Add new target
-                currentTargets.push(targetData);
-                var action = 'added';
-            }
+            // Add new target
+            currentTargets.push(targetData);
 
             // Update via API
             try {
@@ -1289,63 +1496,128 @@ WEB_UI_TEMPLATE = '''
                 });
 
                 if (response.ok) {
-                    showMessage('targets-message', `Target "${name}" ${action} successfully!`, 'success');
+                    showMessage('targets-message', `Target "${name}" added successfully!`, 'success');
+                    // Clear form
+                    document.getElementById('new-target-name').value = '';
+                    document.getElementById('new-target-ip').value = '';
+                    document.getElementById('new-target-interface').value = '';
+                    document.getElementById('new-target-threshold').value = '1';
+                    loadStatus();
+                } else {
+                    const error = await response.json();
+                    showMessage('targets-message', 'Error: ' + error.error, 'error');
+                    currentTargets.pop();
+                }
+            } catch (error) {
+                showMessage('targets-message', 'Error: ' + error.message, 'error');
+                currentTargets.pop();
+            }
+        }
+
+        function editTarget(index) {
+            editingIndex = index;
+            renderTargetsTable();
+        }
+
+        async function saveEdit(index) {
+            const name = document.getElementById(`edit-name-${index}`).value.trim();
+            const ip = document.getElementById(`edit-ip-${index}`).value.trim();
+            const iface = document.getElementById(`edit-interface-${index}`).value;
+            const threshold = parseInt(document.getElementById(`edit-threshold-${index}`).value) || 1;
+
+            if (!name || !ip) {
+                showMessage('targets-message', 'Please enter both name and IP address', 'error');
+                return;
+            }
+
+            const targetData = {name, ip, consecutive_loss_threshold: threshold};
+            if (iface) {
+                targetData.interface = iface;
+            }
+
+            // Update target
+            currentTargets[index] = targetData;
+
+            // Update via API
+            try {
+                const response = await fetch('/api/targets', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({targets: currentTargets})
+                });
+
+                if (response.ok) {
+                    showMessage('targets-message', `Target "${name}" updated successfully!`, 'success');
                     cancelEdit();
                     loadStatus();
                 } else {
                     const error = await response.json();
                     showMessage('targets-message', 'Error: ' + error.error, 'error');
-                    if (editingIndex === null) {
-                        currentTargets.pop(); // Remove if failed to add
-                    }
                 }
             } catch (error) {
                 showMessage('targets-message', 'Error: ' + error.message, 'error');
-                if (editingIndex === null) {
-                    currentTargets.pop(); // Remove if failed to add
-                }
             }
-        }
-
-        function editTarget(index) {
-            const target = currentTargets[index];
-            editingIndex = index;
-
-            // Populate form with target data
-            document.getElementById('new-target-name').value = target.name;
-            document.getElementById('new-target-ip').value = target.ip;
-            document.getElementById('new-target-interface').value = target.interface || '';
-            document.getElementById('new-target-threshold').value = target.consecutive_loss_threshold || 1;
-
-            // Update button text and show cancel button
-            const form = document.querySelector('.add-target-form');
-            const buttonContainer = form.querySelector('div:last-child');
-            buttonContainer.innerHTML = `
-                <label style="opacity: 0;">Save</label>
-                <button onclick="addTarget()" style="background: #2196F3;">💾 Save</button>
-                <button onclick="cancelEdit()" style="background: #666; margin-left: 5px;">✖️ Cancel</button>
-            `;
-
-            // Scroll to form
-            form.scrollIntoView({behavior: 'smooth', block: 'nearest'});
         }
 
         function cancelEdit() {
             editingIndex = null;
+            renderTargetsTable();
+        }
 
-            // Clear form
-            document.getElementById('new-target-name').value = '';
-            document.getElementById('new-target-ip').value = '';
-            document.getElementById('new-target-interface').value = '';
-            document.getElementById('new-target-threshold').value = '1';
+        async function restartTarget(index) {
+            const target = currentTargets[index];
 
-            // Reset button
-            const form = document.querySelector('.add-target-form');
-            const buttonContainer = form.querySelector('div:last-child');
-            buttonContainer.innerHTML = `
-                <label style="opacity: 0;">Add</label>
-                <button onclick="addTarget()">➕ Add Target</button>
-            `;
+            if (!confirm(`Restart target "${target.name}"? This will clear its ping history.`)) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/restart-target', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ip: target.ip})
+                });
+
+                if (response.ok) {
+                    const result = await response.json();
+                    showMessage('targets-message', result.message || 'Target restarted successfully!', 'success');
+                } else {
+                    const error = await response.json();
+                    showMessage('targets-message', 'Error: ' + error.error, 'error');
+                }
+            } catch (error) {
+                showMessage('targets-message', 'Error: ' + error.message, 'error');
+            }
+        }
+
+        async function updateThreshold(index, newValue) {
+            const threshold = parseInt(newValue) || 1;
+            if (threshold < 1 || threshold > 10) {
+                showMessage('targets-message', 'Loss threshold must be between 1 and 10', 'error');
+                renderTargetsTable(); // Reset to original value
+                return;
+            }
+
+            // Update in local array
+            currentTargets[index].consecutive_loss_threshold = threshold;
+
+            // Save to backend
+            try {
+                const response = await fetch('/api/targets', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({targets: currentTargets})
+                });
+
+                if (response.ok) {
+                    showMessage('targets-message', `Loss threshold updated to ${threshold}`, 'success');
+                } else {
+                    const error = await response.json();
+                    showMessage('targets-message', 'Error: ' + error.error, 'error');
+                }
+            } catch (error) {
+                showMessage('targets-message', 'Error: ' + error.message, 'error');
+            }
         }
 
         async function deleteTarget(index) {
@@ -1467,8 +1739,16 @@ WEB_UI_TEMPLATE = '''
                 });
 
                 if (response.ok) {
-                    showMessage('settings-message', 'Font scale saved to ' + scale.toFixed(1) + '! Please manually restart the application to apply.', 'success');
-                    loadStatus();
+                    showMessage('settings-message', 'Font scale updated to ' + scale.toFixed(1) + '! Reloading...', 'success');
+
+                    // Force reload to apply changes
+                    setTimeout(async () => {
+                        await fetch('/api/force-reload', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'}
+                        });
+                        loadStatus();
+                    }, 500);
                 } else {
                     const error = await response.json();
                     showMessage('settings-message', 'Error: ' + error.error, 'error');
@@ -1489,8 +1769,16 @@ WEB_UI_TEMPLATE = '''
                 });
 
                 if (response.ok) {
-                    showMessage('settings-message', 'Chart columns saved to ' + num_columns + '! Please manually restart the application to apply.', 'success');
-                    loadStatus();
+                    showMessage('settings-message', 'Chart columns updated to ' + num_columns + '! Reloading...', 'success');
+
+                    // Force reload to apply changes
+                    setTimeout(async () => {
+                        await fetch('/api/force-reload', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'}
+                        });
+                        loadStatus();
+                    }, 500);
                 } else {
                     const error = await response.json();
                     showMessage('settings-message', 'Error: ' + error.error, 'error');
@@ -1524,24 +1812,8 @@ WEB_UI_TEMPLATE = '''
             }
         }
 
-        // Update slider value display
+        // Setup event listeners
         document.addEventListener('DOMContentLoaded', () => {
-            const lineThicknessSlider = document.getElementById('line-thickness');
-            const fontScaleSlider = document.getElementById('font-scale');
-            const numColumnsSlider = document.getElementById('num-columns');
-
-            lineThicknessSlider.addEventListener('input', (e) => {
-                document.getElementById('line-thickness-value').textContent = e.target.value;
-            });
-
-            fontScaleSlider.addEventListener('input', (e) => {
-                document.getElementById('font-scale-value').textContent = parseFloat(e.target.value).toFixed(1);
-            });
-
-            numColumnsSlider.addEventListener('input', (e) => {
-                document.getElementById('num-columns-value').textContent = e.target.value;
-            });
-
             // Allow Enter key to add target
             document.getElementById('new-target-ip').addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') {
