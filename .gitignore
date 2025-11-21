@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# User-specific config
+config.json
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# Temporary files
+*.log
+*.tmp
+/tmp/
