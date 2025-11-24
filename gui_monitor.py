@@ -3,10 +3,10 @@
 Multi-target ping monitoring GUI desktop application
 Full-screen dashboard with thin line charts - PingPlotter style
 
-Version: 1.04 (Grid Lines & Moving Average)
+Version: 1.05 (Flashing Alert for Failures)
 """
 
-__version__ = "1.04"
+__version__ = "1.05"
 
 import json
 import time
@@ -90,6 +90,11 @@ class PingMonitor:
             target.ip: None for target in self.targets
         }
 
+        # Track alert state per target (for flashing alerts)
+        self.in_alert_state: Dict[str, bool] = {
+            target.ip: False for target in self.targets
+        }
+
         self.running = False
         self.threads: List[threading.Thread] = []
         self.lock = threading.Lock()
@@ -158,11 +163,14 @@ class PingMonitor:
                         self.consecutive_losses[target.ip] = 0
                     if target.ip not in self.last_successful_rtt:
                         self.last_successful_rtt[target.ip] = None
+                    if target.ip not in self.in_alert_state:
+                        self.in_alert_state[target.ip] = False
 
                     if result is not None:
-                        # Ping succeeded
+                        # Ping succeeded - clear alert state
                         self.consecutive_losses[target.ip] = 0
                         self.last_successful_rtt[target.ip] = result
+                        self.in_alert_state[target.ip] = False
 
                         ping_result = PingResult(
                             timestamp=datetime.now(),
@@ -184,13 +192,16 @@ class PingMonitor:
                             )
                             self.history[target.ip].append(ping_result)
                         else:
-                            # At or above threshold: record as actual failure
+                            # At or above threshold: record as actual failure and enter alert state
                             ping_result = PingResult(
                                 timestamp=datetime.now(),
                                 rtt_ms=None,
                                 success=False
                             )
                             self.history[target.ip].append(ping_result)
+
+                            # Enter alert state for flashing
+                            self.in_alert_state[target.ip] = True
 
                             # Retroactively mark previous (threshold-1) masked losses as failures
                             if self.consecutive_losses[target.ip] == threshold and threshold > 1:
@@ -331,11 +342,21 @@ class PingMonitorGUI:
         self.line_thickness = monitor.line_thickness
         self.num_columns = monitor.num_columns
 
+        # Flash state for alert tiles (toggles every 1 second)
+        self.flash_on = False
+        self.start_flash_timer()
+
         # Create grid of charts with EQUAL heights
         self.create_equal_chart_grid()
 
         # Start update loop
         self.update_display()
+
+    def start_flash_timer(self):
+        """Start the 1-second flash toggle timer for alert states"""
+        self.flash_on = not self.flash_on
+        # Schedule next toggle in 1 second (1000ms)
+        self.root.after(1000, self.start_flash_timer)
 
     def get_network_ips(self):
         """Get all network IP addresses (excluding localhost)"""
@@ -509,10 +530,15 @@ class PingMonitorGUI:
             # Clear previous plot
             ax.clear()
 
-            # Re-apply title after clear (left side)
+            # Check if this target is in alert state (for flashing)
+            in_alert = self.monitor.in_alert_state.get(target.ip, False)
+            flash_active = in_alert and self.flash_on
+
+            # Re-apply title after clear (left side) - flash red when in alert
             target_obj = chart['target']
+            title_color = '#ff0000' if flash_active else '#ffffff'
             ax.set_title(f"{target_obj.name} ({target_obj.ip})",
-                        color='#ffffff', fontsize=int(9*self.font_scale), loc='left', pad=3)
+                        color=title_color, fontsize=int(9*self.font_scale), loc='left', pad=3)
 
             # Determine Y limit and max RTT from ALL data in window
             # DYNAMIC Y-AXIS based on actual data with 25% headroom
@@ -564,13 +590,14 @@ class PingMonitorGUI:
                 ax.axhspan(200, y_max, facecolor='#ff3333', alpha=0.3, zorder=1)
 
             if not chart_data:
-                # Empty chart styling
+                # Empty chart styling - flash background red when in alert
                 ax.set_xlim(time_window_start, now)
                 ax.set_ylim(0, y_max)
-                ax.set_facecolor('#404040')
+                bg_color = '#ff0000' if flash_active else '#404040'
+                ax.set_facecolor(bg_color)
                 for spine in ax.spines.values():
-                    spine.set_color('#666666')
-                    spine.set_linewidth(0.5)
+                    spine.set_color('#ff0000' if flash_active else '#666666')
+                    spine.set_linewidth(2 if flash_active else 0.5)
                 ax.tick_params(colors='#aaaaaa', labelsize=int(6*self.font_scale), length=2, width=0.5)
                 ax.set_ylabel('ms', color='#aaaaaa', fontsize=int(7*self.font_scale))
                 ax.grid(True, alpha=0.15, color='#666666', linewidth=0.3)
@@ -618,11 +645,12 @@ class PingMonitorGUI:
             ax.axhline(y=100, color='#888888', linestyle='--', linewidth=0.5, alpha=0.4, zorder=2)
             ax.axhline(y=200, color='#888888', linestyle='--', linewidth=0.5, alpha=0.4, zorder=2)
 
-            # Style
-            ax.set_facecolor('#404040')
+            # Style - flash background and border red when in alert
+            bg_color = '#ff0000' if flash_active else '#404040'
+            ax.set_facecolor(bg_color)
             for spine in ax.spines.values():
-                spine.set_color('#666666')
-                spine.set_linewidth(0.5)
+                spine.set_color('#ff0000' if flash_active else '#666666')
+                spine.set_linewidth(2 if flash_active else 0.5)
             ax.tick_params(colors='#aaaaaa', labelsize=int(6*self.font_scale), length=2, width=0.5)
             ax.set_ylabel('ms', color='#aaaaaa', fontsize=int(7*self.font_scale))
 
