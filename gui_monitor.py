@@ -58,6 +58,7 @@ class Target:
     name: str
     interface: Optional[str] = None  # Network interface to use for ping
     consecutive_loss_threshold: int = 1  # Number of consecutive losses before marking as down (1 = plot all)
+    show_average: bool = True  # Show moving average line on chart
 
 
 class PingMonitor:
@@ -74,6 +75,7 @@ class PingMonitor:
         self.chart_window_minutes = self.config['chart_time_window_minutes']
         self.line_thickness = self.config.get('line_thickness', 3.2)
         self.num_columns = self.config.get('num_columns', 2)
+        self.grid_enabled = self.config.get('grid_enabled', True)
 
         # Store ping history: {ip: deque of PingResult}
         self.history: Dict[str, deque] = {
@@ -115,10 +117,22 @@ class PingMonitor:
 
             print(f"[v1.03] Started continuous ping for {target.name} ({target.ip})")
 
+            # Check if process started successfully
+            if process.poll() is not None:
+                stderr_output = process.stderr.read() if process.stderr else "No stderr"
+                print(f"[v1.03] ERROR: Ping process died immediately for {target.ip}. Stderr: {stderr_output}")
+                return
+
             # Read output line by line
+            line_count = 0
             for line in iter(process.stdout.readline, ''):
                 if not self.running:
+                    print(f"[v1.03] DEBUG: Ping worker stopping (self.running=False) for {target.ip}")
                     break
+
+                line_count += 1
+                if line_count == 1:
+                    print(f"[v1.03] DEBUG: First line received for {target.ip}: {line[:50]}")
 
                 line = line.strip()
                 if not line:
@@ -189,6 +203,9 @@ class PingMonitor:
                                         history[i].success = False
 
                     self._cleanup_old_data(target.ip)
+
+            # Loop exited
+            print(f"[v1.03] DEBUG: Readline loop exited for {target.ip}. Lines read: {line_count}. Process returncode: {process.poll()}")
 
         except Exception as e:
             print(f"[v1.03] Ping worker error for {target.ip}: {e}")
@@ -584,6 +601,15 @@ class PingMonitorGUI:
             if success_times and success_rtts:
                 ax.plot(success_times, success_rtts, color='#ffffff', linewidth=self.monitor.line_thickness, alpha=0.9, zorder=3)
 
+                # Plot MOVING AVERAGE LINE (cumulative average in visible window)
+                target_obj = chart['target']
+                if target_obj.show_average and len(success_rtts) > 1:
+                    # Calculate cumulative average for all points in window
+                    cumulative_avg = sum(success_rtts) / len(success_rtts)
+                    # Draw horizontal average line across the visible time window
+                    ax.axhline(y=cumulative_avg, color='#6699ff', linestyle=':',
+                              linewidth=self.monitor.line_thickness * 0.7, alpha=0.8, zorder=2.5)
+
             # FIXED TIME WINDOW
             ax.set_xlim(time_window_start, now)
             ax.set_ylim(0, y_max)
@@ -599,11 +625,16 @@ class PingMonitorGUI:
                 spine.set_linewidth(0.5)
             ax.tick_params(colors='#aaaaaa', labelsize=int(6*self.font_scale), length=2, width=0.5)
             ax.set_ylabel('ms', color='#aaaaaa', fontsize=int(7*self.font_scale))
-            ax.grid(True, alpha=0.15, color='#666666', linewidth=0.3, zorder=2)
 
-            # Format x-axis with better time labels
+            # Format x-axis with smooth time labels
+            # Use AutoDateLocator for smooth scrolling without jumping
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%I:%M%p'))
-            ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=5))
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=7))
+
+            # Optional grid lines (global setting) - AFTER axis formatting
+            if self.monitor.grid_enabled:
+                ax.grid(True, which='both', axis='both', alpha=0.3, color='#aaaaaa',
+                       linewidth=0.5, linestyle=':', zorder=1)
 
             # Add stats text at top right (OUTSIDE graph, as right title)
             stats = self.monitor.get_stats(target.ip)
@@ -763,10 +794,11 @@ class WebController:
             """Update chart window duration"""
             try:
                 duration = request.json.get('duration')
-                if duration not in [1, 5, 10, 30, 60]:
-                    return jsonify({'error': 'Invalid duration. Must be 1, 5, 10, 30, or 60'}), 400
+                # Allow all time window values: 1min, 5min, 10min, 30min, 60min, 3h, 6h, 12h, 24h
+                if duration not in [1, 5, 10, 30, 60, 180, 360, 720, 1440]:
+                    return jsonify({'error': 'Invalid duration. Must be 1, 5, 10, 30, 60, 180, 360, 720, or 1440 minutes'}), 400
 
-                # Update monitor directly (this doesn't need to be saved to config)
+                # Update monitor directly (takes effect immediately)
                 self.monitor.chart_window_minutes = duration
 
                 return jsonify({'status': 'success'})
@@ -895,6 +927,31 @@ class WebController:
                     json.dump(config, f, indent=2)
 
                 return jsonify({'status': 'success', 'message': 'Chart columns saved. Restart required.'})
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/grid-enabled', methods=['POST'])
+        def update_grid_enabled():
+            """Update grid lines visibility (takes effect immediately)"""
+            try:
+                grid_enabled = request.json.get('grid_enabled')
+                if grid_enabled is None:
+                    return jsonify({'error': 'Missing grid_enabled parameter'}), 400
+
+                # Load current config
+                with open(self.config_path, 'r') as f:
+                    config = json.load(f)
+
+                config['grid_enabled'] = grid_enabled
+
+                # Save
+                with open(self.config_path, 'w') as f:
+                    json.dump(config, f, indent=2)
+
+                # Update monitor in realtime
+                self.monitor.grid_enabled = grid_enabled
+
+                return jsonify({'status': 'success', 'message': 'Grid lines ' + ('enabled' if grid_enabled else 'disabled')})
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
 
@@ -1256,11 +1313,12 @@ WEB_UI_TEMPLATE = '''
                         <th>IP Address</th>
                         <th>Interface</th>
                         <th>Loss Threshold</th>
+                        <th style="width: 90px; text-align: center;">Show Avg</th>
                         <th style="width: 120px; text-align: center;">Actions</th>
                     </tr>
                 </thead>
                 <tbody id="targets-table">
-                    <tr><td colspan="5" style="text-align: center; color: #888;">Loading...</td></tr>
+                    <tr><td colspan="6" style="text-align: center; color: #888;">Loading...</td></tr>
                 </tbody>
             </table>
 
@@ -1334,6 +1392,12 @@ WEB_UI_TEMPLATE = '''
                     <input type="number" id="num-columns" min="1" max="10" value="2" step="1" style="width: 60px; padding: 6px;">
                     <button onclick="updateNumColumns()" style="padding: 6px 10px;">💾 & Restart</button>
                 </div>
+
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <label style="min-width: 140px;">Show Grid Lines</label>
+                    <input type="checkbox" id="grid-enabled" checked style="width: 20px; height: 20px; cursor: pointer;">
+                    <button onclick="updateGridEnabled()" style="padding: 6px 10px;">💾</button>
+                </div>
             </div>
         </div>
     </div>
@@ -1390,6 +1454,11 @@ WEB_UI_TEMPLATE = '''
                 const config = await configResponse.json();
                 if (config.font_scale !== undefined) {
                     document.getElementById('font-scale').value = config.font_scale;
+                }
+
+                // Update grid_enabled
+                if (config.grid_enabled !== undefined) {
+                    document.getElementById('grid-enabled').checked = config.grid_enabled;
                 }
 
                 currentTargets = data.targets || [];
@@ -1456,6 +1525,11 @@ WEB_UI_TEMPLATE = '''
                                 <input type="number" min="1" max="10" value="${target.consecutive_loss_threshold || 1}"
                                        onchange="updateThreshold(${index}, this.value)"
                                        style="width: 60px; padding: 4px; text-align: center;">
+                            </td>
+                            <td style="text-align: center;">
+                                <input type="checkbox" ${target.show_average !== false ? 'checked' : ''}
+                                       onchange="updateShowAverage(${index}, this.checked)"
+                                       style="width: 20px; height: 20px; cursor: pointer;">
                             </td>
                             <td style="text-align: center; white-space: nowrap;">
                                 <button onclick="editTarget(${index})" class="btn-primary btn-small" style="margin-right: 3px;" title="Edit">✏️</button>
@@ -1611,6 +1685,29 @@ WEB_UI_TEMPLATE = '''
 
                 if (response.ok) {
                     showMessage('targets-message', `Loss threshold updated to ${threshold}`, 'success');
+                } else {
+                    const error = await response.json();
+                    showMessage('targets-message', 'Error: ' + error.error, 'error');
+                }
+            } catch (error) {
+                showMessage('targets-message', 'Error: ' + error.message, 'error');
+            }
+        }
+
+        async function updateShowAverage(index, checked) {
+            // Update in local array
+            currentTargets[index].show_average = checked;
+
+            // Save to backend
+            try {
+                const response = await fetch('/api/targets', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({targets: currentTargets})
+                });
+
+                if (response.ok) {
+                    showMessage('targets-message', `Average line ${checked ? 'enabled' : 'disabled'}`, 'success');
                 } else {
                     const error = await response.json();
                     showMessage('targets-message', 'Error: ' + error.error, 'error');
@@ -1779,6 +1876,28 @@ WEB_UI_TEMPLATE = '''
                         });
                         loadStatus();
                     }, 500);
+                } else {
+                    const error = await response.json();
+                    showMessage('settings-message', 'Error: ' + error.error, 'error');
+                }
+            } catch (error) {
+                showMessage('settings-message', 'Error: ' + error.message, 'error');
+            }
+        }
+
+        async function updateGridEnabled() {
+            try {
+                const grid_enabled = document.getElementById('grid-enabled').checked;
+
+                const response = await fetch('/api/grid-enabled', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({grid_enabled})
+                });
+
+                if (response.ok) {
+                    showMessage('settings-message', 'Grid lines ' + (grid_enabled ? 'enabled' : 'disabled') + '!', 'success');
+                    loadStatus();
                 } else {
                     const error = await response.json();
                     showMessage('settings-message', 'Error: ' + error.error, 'error');
