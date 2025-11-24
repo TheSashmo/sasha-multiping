@@ -4,7 +4,7 @@ Full-screen terminal dashboard for monitoring multiple network targets with real
 
 ## Features
 
-- **Real-time monitoring** of 17 network targets
+- **Real-time monitoring**
 - **Full-screen terminal UI** with auto-refresh
 - **Live charts** showing ping latency over time
 - **Color-coded status indicators** (green=online, red=offline)
@@ -90,13 +90,3 @@ Edit `config.json` to customize:
 ### Terminal too small
 - Resize your terminal to at least 120x40 for best viewing
 - Use full-screen terminal mode
-
-## Monitored Targets
-
-Current configuration monitors:
-- Nextologies servers (s1, s2, s3, talk2)
-- Public DNS (Google, Cloudflare, Yahoo)
-- Local network gateways
-- International servers (Brazil, Germany)
-- Streaming servers (fls1.nxto.tv, ACS5)
-- Storage and Dante network devices
