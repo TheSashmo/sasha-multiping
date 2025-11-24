@@ -3,10 +3,10 @@
 Multi-target ping monitoring GUI desktop application
 Full-screen dashboard with thin line charts - PingPlotter style
 
-Version: 1.05 (Flashing Alert for Failures)
+Version: 1.06 (Network Disconnect Detection)
 """
 
-__version__ = "1.05"
+__version__ = "1.06"
 
 import json
 import time
@@ -95,6 +95,11 @@ class PingMonitor:
             target.ip: False for target in self.targets
         }
 
+        # Track last ping time per target (for stale data detection)
+        self.last_ping_time: Dict[str, datetime] = {
+            target.ip: datetime.now() for target in self.targets
+        }
+
         self.running = False
         self.threads: List[threading.Thread] = []
         self.lock = threading.Lock()
@@ -165,6 +170,11 @@ class PingMonitor:
                         self.last_successful_rtt[target.ip] = None
                     if target.ip not in self.in_alert_state:
                         self.in_alert_state[target.ip] = False
+                    if target.ip not in self.last_ping_time:
+                        self.last_ping_time[target.ip] = datetime.now()
+
+                    # Update last ping time (we received data from ping process)
+                    self.last_ping_time[target.ip] = datetime.now()
 
                     if result is not None:
                         # Ping succeeded - clear alert state
@@ -308,6 +318,20 @@ class PingMonitor:
 
         cutoff = datetime.now() - timedelta(minutes=self.chart_window_minutes)
         return [p for p in history if p.timestamp >= cutoff]
+
+    def check_stale_data(self):
+        """Check for stale data (no ping received for too long) and set alert state"""
+        # Consider data stale if no ping received for 3x the ping interval + timeout
+        stale_threshold = timedelta(seconds=(self.ping_interval * 3) + self.timeout + 5)
+        now = datetime.now()
+
+        with self.lock:
+            for target in self.targets:
+                if target.ip in self.last_ping_time:
+                    time_since_last = now - self.last_ping_time[target.ip]
+                    if time_since_last > stale_threshold:
+                        # No data received - likely network disconnected
+                        self.in_alert_state[target.ip] = True
 
 
 class PingMonitorGUI:
@@ -695,6 +719,9 @@ class PingMonitorGUI:
                 # Recreate chart grid with new targets
                 self.create_equal_chart_grid()
                 print(f"[GUI] Charts rebuilt with {len(self.monitor.targets)} targets")
+
+            # Check for stale data (network disconnect detection)
+            self.monitor.check_stale_data()
 
             self.update_charts()
 
