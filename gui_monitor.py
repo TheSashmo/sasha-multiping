@@ -3,10 +3,10 @@
 Multi-target ping monitoring GUI desktop application
 Full-screen dashboard with thin line charts - PingPlotter style
 
-Version: 1.06 (Network Disconnect Detection)
+Version: 1.07 (Dynamic Column Configuration)
 """
 
-__version__ = "1.06"
+__version__ = "1.07"
 
 import json
 import time
@@ -475,8 +475,16 @@ class PingMonitorGUI:
 
     def create_equal_chart_grid(self):
         """Create grid with configurable columns"""
+        # Refresh num_columns from monitor (may have been updated via web API)
+        self.num_columns = self.monitor.num_columns
+
         num_targets = len(self.monitor.targets)
         num_rows = (num_targets + self.num_columns - 1) // self.num_columns  # Round up
+
+        # Reset grid configuration
+        for i in range(20):  # Clear any old row/column configs
+            self.main_frame.grid_rowconfigure(i, weight=0)
+            self.main_frame.grid_columnconfigure(i, weight=0)
 
         # Configure grid to have equal weight for all rows
         for i in range(num_rows):
@@ -493,7 +501,7 @@ class PingMonitorGUI:
 
         # Update target tracking
         self.current_target_ips = {target.ip for target in self.monitor.targets}
-        print(f"Chart grid created/updated with {len(self.current_target_ips)} targets")
+        print(f"Chart grid created/updated with {len(self.current_target_ips)} targets, {self.num_columns} columns")
 
     def create_line_chart(self, target: Target, row: int, col: int):
         """Create a thin-line chart for a single target with stats"""
@@ -965,7 +973,7 @@ class WebController:
 
         @self.app.route('/api/num-columns', methods=['POST'])
         def update_num_columns():
-            """Update number of chart columns (requires restart to take effect)"""
+            """Update number of chart columns (takes effect immediately)"""
             try:
                 num_cols = request.json.get('num_columns')
                 if num_cols is None or num_cols < 1 or num_cols > 10:
@@ -981,7 +989,12 @@ class WebController:
                 with open(self.config_path, 'w') as f:
                     json.dump(config, f, indent=2)
 
-                return jsonify({'status': 'success', 'message': 'Chart columns saved. Restart required.'})
+                # Update monitor directly (takes effect immediately)
+                self.monitor.num_columns = num_cols
+                # Set flag to trigger GUI rebuild
+                self.monitor.targets_changed = True
+
+                return jsonify({'status': 'success', 'message': 'Chart columns updated!'})
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
 
