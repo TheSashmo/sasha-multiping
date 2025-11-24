@@ -11,8 +11,10 @@ ENV/
 # User-specific config
 config.json
 
-# Screenshots with IPs
-ip_list.png
+# Screenshots and images
+*.png
+*.jpg
+*.jpeg
 
 # IDE
 .vscode/
