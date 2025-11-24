@@ -3,10 +3,10 @@
 Multi-target ping monitoring GUI desktop application
 Full-screen dashboard with thin line charts - PingPlotter style
 
-Version: 1.03 (Continuous Ping Implementation)
+Version: 1.04 (Grid Lines & Moving Average)
 """
 
-__version__ = "1.03"
+__version__ = "1.04"
 
 import json
 import time
